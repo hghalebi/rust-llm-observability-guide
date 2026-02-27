@@ -62,7 +62,7 @@ If your output is flat (all spans at one level), you are blind to the real contr
 
 From the `rust-llm-observability-guide` folder:
 
-- Core guide: `README-otel-signoz-rig-agents.md`
+- Core guide: `README.md`
 - Telemetry setup: `examples/otel.rs`
 - Smoke example: `examples/otel_smoke.rs`
 - Gemini examples:  
