@@ -51,7 +51,7 @@ If your output is flat (all spans at one level), you are blind to the real contr
 
 ### What you need before you begin
 
-- Rust and Cargo (`rustup`, `cargo`; Rust 1.70+ recommended).
+- Rust and Cargo (`rustup`, `cargo`; Rust 1.85+ recommended).
 - Docker installed and running (`docker` command available).
 - `nc` (netcat) available.
 - A valid `GEMINI_API_KEY` for Gemini examples.
@@ -279,9 +279,22 @@ Call this in each `main` before work begins.
 ## 7) Example A: one request, one model (`gemini_rig_basic.rs`)
 
 ```rust
+use rig::telemetry::SpanCombinator;
+
 #[tracing::instrument(name = "rig_gemini_basic_prompt")]
 async fn run_prompt() -> anyhow::Result<String> {
     let client = rig::providers::gemini::Client::from_env();
+    let prompt_text = "Explain OpenTelemetry in exactly 3 bullets for a Rust backend engineer.";
+    let prompt_span = tracing::info_span!(
+        "agent.prompt",
+        model = "gemini-2.5-flash",
+        stage = "planner"
+    );
+    let _prompt_guard = prompt_span.enter();
+    prompt_span.record_model_input(&serde_json::json!({
+        "prompt": prompt_text,
+    }));
+
     let agent = client
         .agent("gemini-2.5-flash")
         .preamble("You are a concise technical assistant. Answer clearly and with short bullets.")
@@ -291,9 +304,14 @@ async fn run_prompt() -> anyhow::Result<String> {
     tracing::info!(model = "gemini-2.5-flash", "Sending prompt to Gemini");
 
     let answer = agent
-        .prompt("Explain OpenTelemetry in exactly 3 bullets for a Rust backend engineer.")
+        .prompt(prompt_text)
         .await
         .context("Gemini prompt failed")?;
+
+    prompt_span.record_model_output(&serde_json::json!({
+        "response_len": answer.len(),
+        "response_preview": answer.chars().take(120).collect::<String>(),
+    }));
 
     tracing::info!(response_len = answer.len(), "Received response");
     Ok(answer)
@@ -303,7 +321,8 @@ async fn run_prompt() -> anyhow::Result<String> {
 ### What to observe
 
 - Root span = request
-- Event logs = "sending" and "received"
+- `SpanCombinator` records model input/output for the planner span
+- output includes response length and short preview
 - Good first pattern to confirm your pipeline works
 
 ---
@@ -311,9 +330,22 @@ async fn run_prompt() -> anyhow::Result<String> {
 ## 8) Example B: add a tool call (`gemini_rig_tools.rs`)
 
 ```rust
+use rig::telemetry::SpanCombinator;
+
 #[tracing::instrument(name = "rig_gemini_with_tool")]
 async fn run_tool_agent() -> anyhow::Result<String> {
     let client = rig::providers::gemini::Client::from_env();
+    let prompt = "Use the add_numbers tool to compute 42 + 58";
+    let tool_span = tracing::info_span!(
+        "agent.planner",
+        model = "gemini-2.5-flash",
+        role = "planner"
+    );
+    let _tool_guard = tool_span.enter();
+    tool_span.record_model_input(&serde_json::json!({
+        "task": "Use add_numbers tool for arithmetic",
+        "prompt": prompt,
+    }));
 
     let agent = client
         .agent("gemini-2.5-flash")
@@ -324,9 +356,14 @@ async fn run_tool_agent() -> anyhow::Result<String> {
         .build();
 
     let answer = agent
-        .prompt("Use the add_numbers tool to compute 42 + 58")
+        .prompt(prompt)
         .await
         .context("Gemini tool-enabled prompt failed")?;
+
+    tool_span.record_model_output(&serde_json::json!({
+        "response_len": answer.len(),
+        "response_preview": answer.chars().take(120).collect::<String>(),
+    }));
 
     Ok(answer)
 }
@@ -336,6 +373,14 @@ Tool call span inside `AddTool::call`:
 
 ```rust
 let span = tracing::info_span!("tool.add_numbers", x = args.x, y = args.y);
+span.record_model_input(&args);
+let _guard = span.enter();
+tracing::info!("Executing math tool");
+let result = args.x + args.y;
+span.record_model_output(&serde_json::json!({
+    "result": result,
+}));
+Ok(result)
 ```
 
 ### Why this matters in the first instrumentation pass
@@ -349,10 +394,16 @@ Without this explicit child span, tool work disappears behind a model span and y
 ## 9) Example C: two-stage orchestration (`gemini_multi_agent.rs`)
 
 ```rust
+use rig::telemetry::SpanCombinator;
+
 #[tracing::instrument(name = "rig_gemini_multi_agent")]
 async fn run_orchestration(topic: &str) -> anyhow::Result<String> {
     let orchestrator = tracing::info_span!("agent_orchestrator", task = topic);
     let _orchestrator_guard = orchestrator.enter();
+    orchestrator.record_model_input(&serde_json::json!({
+        "topic": topic,
+        "workflow": "planner_then_writer",
+    }));
 
     let client = rig::providers::gemini::Client::from_env();
 
@@ -362,11 +413,27 @@ async fn run_orchestration(topic: &str) -> anyhow::Result<String> {
         .temperature(0.2)
         .build();
 
+    let planner_prompt = format!("Create a practical rollout plan for this topic: {topic}");
+    let planner_span = tracing::info_span!(
+        "agent.planner",
+        model = "gemini-2.5-pro",
+        agent_role = "planner",
+        task = topic
+    );
+    let _planner_guard = planner_span.enter();
+    planner_span.record_model_input(&serde_json::json!({
+        "prompt": planner_prompt,
+    }));
+
     tracing::info!(agent = "planner", "Running planner step");
     let plan = planner
-        .prompt(format!("Create a practical rollout plan for this topic: {topic}"))
+        .prompt(planner_prompt)
         .await
         .context("Planner step failed")?;
+    planner_span.record_model_output(&serde_json::json!({
+        "plan_len": plan.len(),
+        "plan_preview": plan.chars().take(180).collect::<String>(),
+    }));
 
     let writer = client
         .agent("gemini-2.5-flash")
@@ -376,12 +443,26 @@ async fn run_orchestration(topic: &str) -> anyhow::Result<String> {
 
     let writer_span = tracing::info_span!("agent_writer");
     let _writer_guard = writer_span.enter();
+    let writer_prompt = format!("Summarize this plan into 5 short bullet points:\n\n{plan}");
+    writer_span.record_model_input(&serde_json::json!({
+        "model": "gemini-2.5-flash",
+        "prompt": writer_prompt,
+    }));
 
     tracing::info!(agent = "writer", "Running rewrite step");
     let summary = writer
-        .prompt(format!("Summarize this plan into 5 short bullet points:\n\n{plan}"))
+        .prompt(writer_prompt)
         .await
         .context("Writer step failed")?;
+    writer_span.record_model_output(&serde_json::json!({
+        "response_len": summary.len(),
+        "response_preview": summary.chars().take(180).collect::<String>(),
+    }));
+
+    orchestrator.record_model_output(&serde_json::json!({
+        "plan_len": plan.len(),
+        "summary_len": summary.len(),
+    }));
 
     Ok(format!("Plan:\n{plan}\n\nExecutive summary:\n{summary}"))
 }
@@ -472,6 +553,8 @@ What you should see when successful:
 - a `ResourceSpans` block in collector logs containing `otel_smoke_probe`
 - an attribute line where `marker` equals your `OTEL_SMOKE_MARKER`
 
+If the collector endpoint is not set, the script skips smoke and prints a clear skip reason.
+
 ## 11.2 Run all runnable examples (scripted)
 
 Run the tutorial examples from one command:
@@ -492,6 +575,19 @@ Use it after the smoke test script to quickly confirm both code paths:
 
 - telemetry path (`otel_smoke`)  
 - agent behavior (`gemini_rig_basic`, `gemini_rig_tools`, `gemini_multi_agent`)
+
+Recent script status in this repository:
+
+```text
+Summary: PASS=4  FAIL=0  SKIP=0
+All runnable examples completed.
+```
+
+If you do not have a collector endpoint set, you should observe:
+
+```text
+Summary: PASS=3  FAIL=0  SKIP=1
+```
 
 ## 12) Common first-pass mistakes and corrections
 
@@ -663,9 +759,50 @@ Level-up goal:
 - Keep model spans aligned to GenAI semantic fields where possible (model/provider/operation).
 - Enforce prompt/PII hygiene in one place (prefer collector processors when possible).
 
+### 14.10 Using `SpanCombinator` for custom spans
+
+`rig::telemetry::SpanCombinator` is useful when you want your own spans to carry the same telemetry language as Rig’s internal model spans.
+
+In this tutorial repo, we now use it in:
+
+- `examples/gemini_rig_basic.rs` (`agent.prompt` span records model input/output)
+- `examples/gemini_rig_tools.rs` (tool execution span records add/sub input/output equivalents and planner span captures call context)
+- `examples/gemini_multi_agent.rs` (planner/writer stages record request and response context)
+
+This gives you a parent-child structure where:
+
+- Rig’s provider call still writes the standard LLM fields (`gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.usage.*`) when available.
+- Your orchestration spans add stable business semantics (`agent.planner`, `tool.add_numbers`, `agent.writer`) that are easy to filter in SigNoz.
+
+Quick usage pattern:
+
+```rust
+use rig::telemetry::SpanCombinator;
+
+let span = tracing::info_span!("agent.planner", model = "gemini-2.5-flash");
+let _guard = span.enter();
+
+span.record_model_input(&serde_json::json!({
+    "prompt": "Create a rollout plan for tracing in an agent pipeline.",
+}));
+
+let response = "planner result ...";
+span.record_model_output(&serde_json::json!({
+    "response_len": response.len(),
+    "response_preview": response.chars().take(120).collect::<String>(),
+}));
+```
+
+You can optionally add:
+
+- `span.record_token_usage(&usage)` when you have a response object with token metadata (`GetTokenUsage`),
+- `span.record_response_metadata(&response)` when you have provider response metadata (`ProviderResponseExt`).
+
+For this reason, this pattern is most helpful in your orchestration stages and tool calls while leaving model-provider call semantics to Rig’s internal instrumentation.
+
 ---
 
-## 14.10 Staged path: onboarding depth vs production rigor (same architecture)
+## 14.11 Staged path: onboarding depth vs production rigor (same architecture)
 
 Use this comparison to avoid overengineering when learning, then harden safely.
 

@@ -5,7 +5,7 @@ edition = "2024"
 description = "OpenTelemetry + SigNoz tutorial for Rig Gemini agents with practical Rust examples"
 license = "MIT"
 readme = "README.md"
-rust-version = "1.70"
+rust-version = "1.85"
 categories = ["development-tools", "api-bindings"]
 keywords = ["opentelemetry", "signoz", "rig", "gemini", "tracing", "observability"]
 

@@ -2,6 +2,7 @@ use anyhow::Context;
 use rig::prelude::*;
 use rig::completion::Prompt;
 use rig::{completion::ToolDefinition, providers::gemini, tool::Tool};
+use rig::telemetry::SpanCombinator;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -51,16 +52,31 @@ impl Tool for AddTool {
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
         let span = tracing::info_span!("tool.add_numbers", x = args.x, y = args.y);
+        span.record_model_input(&args);
         let _guard = span.enter();
 
         tracing::info!("Executing math tool");
-        Ok(args.x + args.y)
+        let result = args.x + args.y;
+
+        span.record_model_output(&result);
+        Ok(result)
     }
 }
 
 #[tracing::instrument(name = "rig_gemini_with_tool")]
 async fn run_tool_agent() -> anyhow::Result<String> {
     let client = gemini::Client::from_env();
+    let prompt = "Use the add_numbers tool to compute 42 + 58";
+    let tool_span = tracing::info_span!(
+        "agent.planner",
+        model = "gemini-2.5-flash",
+        role = "planner"
+    );
+    let _tool_guard = tool_span.enter();
+    tool_span.record_model_input(&json!({
+        "task": "Use add_numbers tool for arithmetic",
+        "prompt": prompt,
+    }));
 
     let agent = client
         .agent("gemini-2.5-flash")
@@ -71,9 +87,14 @@ async fn run_tool_agent() -> anyhow::Result<String> {
         .build();
 
     let answer = agent
-        .prompt("Use the add_numbers tool to compute 42 + 58")
+        .prompt(prompt)
         .await
         .context("Gemini tool-enabled prompt failed")?;
+
+    tool_span.record_model_output(&json!({
+        "response_len": answer.len(),
+        "response_preview": answer.chars().take(120).collect::<String>(),
+    }));
 
     Ok(answer)
 }

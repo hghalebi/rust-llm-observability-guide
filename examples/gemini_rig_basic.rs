@@ -1,6 +1,8 @@
 use anyhow::Context;
 use rig::prelude::*;
 use rig::{completion::Prompt, providers::gemini};
+use rig::telemetry::SpanCombinator;
+use serde_json::json;
 
 mod otel;
 
@@ -14,13 +16,29 @@ async fn run_prompt() -> anyhow::Result<String> {
         .temperature(0.2)
         .build();
 
+    let prompt_text =
+        "Explain OpenTelemetry in exactly 3 bullets for a Rust backend engineer.";
+    let prompt_span = tracing::info_span!(
+        "agent.prompt",
+        model = "gemini-2.5-flash",
+        stage = "planner"
+    );
+    let _prompt_guard = prompt_span.enter();
+
+    prompt_span.record_model_input(&json!({
+        "prompt": prompt_text,
+    }));
     tracing::info!(model = "gemini-2.5-flash", "Sending prompt to Gemini");
 
     let answer = agent
-        .prompt("Explain OpenTelemetry in exactly 3 bullets for a Rust backend engineer.")
+        .prompt(prompt_text)
         .await
         .context("Gemini prompt failed")?;
 
+    prompt_span.record_model_output(&json!({
+        "response_len": answer.len(),
+        "response_preview": answer.chars().take(120).collect::<String>(),
+    }));
     tracing::info!(response_len = answer.len(), "Received response");
 
     Ok(answer)
